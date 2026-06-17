@@ -3,3 +3,7 @@ pandas>=2.0
 plotly>=5.18
 openpyxl>=3.1
 xlsxwriter>=3.1
+streamlit
+pandas
+openpyxl
+matplotlib
