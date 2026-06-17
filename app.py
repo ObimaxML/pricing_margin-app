@@ -1,4 +1,4 @@
-"""
+""""
 Pricing & Margin Model - Streamlit Web App
 ===========================================
 Interactive calculator for a repackaging business that buys 5kg bags from a
@@ -89,6 +89,37 @@ order_qty_bags = st.sidebar.number_input(
     "Order quantity (paid bags)", min_value=1, value=50, step=1,
 )
 
+st.sidebar.subheader("Variable Costs")
+transport_cost = st.sidebar.number_input(
+    "Transport / collection cost (R per order)",
+    min_value=0.0, value=150.0, step=10.0,
+    help="Fuel, delivery, or collection cost for the entire order.",
+)
+other_variable_cost = st.sidebar.number_input(
+    "Other variable costs (R per order)",
+    min_value=0.0, value=0.0, step=10.0,
+    help="Any other variable costs per order (e.g. labour, storage).",
+)
+total_variable_cost = transport_cost + other_variable_cost
+
+st.sidebar.subheader("Payment Terms")
+payment_term = st.sidebar.selectbox(
+    "Supplier payment term",
+    options=["Cash on Delivery", "7-Day", "14-Day", "30-Day"],
+    index=0,
+    help="When payment to the supplier is due.",
+)
+TERM_DAYS = {"Cash on Delivery": 0, "7-Day": 7, "14-Day": 14, "30-Day": 30}
+term_days = TERM_DAYS[payment_term]
+
+customer_term = st.sidebar.selectbox(
+    "Customer payment term (receivables)",
+    options=["Cash on Delivery", "7-Day", "14-Day", "30-Day"],
+    index=0,
+    help="When your customers pay you.",
+)
+customer_term_days = TERM_DAYS[customer_term]
+
 st.sidebar.subheader("Selling Prices & Packaging")
 variants = logic.default_variants()
 for v in variants:
@@ -120,7 +151,8 @@ for v in variants:
 
 ue_df = logic.unit_economics(variants, bag_cost, free_stock_pct)
 order = logic.first_order_mix(
-    variants, bag_cost, free_stock_pct, budget, order_qty_bags, mix_weights
+    variants, bag_cost, free_stock_pct, budget, order_qty_bags, mix_weights,
+    variable_cost=total_variable_cost,
 )
 order_df = order["table"]
 summ = order["summary"]
@@ -130,6 +162,10 @@ plan_df = logic.weekly_sales_plan(
 )
 
 eff_cpg = logic.cost_per_gram(bag_cost, free_stock_pct)
+
+# Cash-flow timing calculations
+days_cash_tied = max(0, customer_term_days - term_days)
+cash_at_risk = summ["investment"] + total_variable_cost
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +179,16 @@ def build_excel() -> bytes:
         order_df.to_excel(writer, sheet_name="First Order Mix", index=False)
         pd.DataFrame([summ]).to_excel(writer, sheet_name="Order Summary", index=False)
         plan_df.to_excel(writer, sheet_name="5-Week Plan", index=False)
+        pd.DataFrame([{
+            "Supplier Term": payment_term,
+            "Customer Term": customer_term,
+            "Cash Gap (days)": days_cash_tied,
+            "Transport Cost (R)": transport_cost,
+            "Other Variable Cost (R)": other_variable_cost,
+            "Total Variable Cost (R)": total_variable_cost,
+            "Net Profit after Var. Costs (R)": round(summ["total_profit"] - total_variable_cost, 2),
+            "Total Investment incl. Var. Costs (R)": round(summ["investment"] + total_variable_cost, 2),
+        }]).to_excel(writer, sheet_name="Cash Flow & Terms", index=False)
     return buf.getvalue()
 
 
@@ -156,13 +202,17 @@ st.caption(
     "variants • track margins, cash turnover and a 5-week plan."
 )
 
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Effective Bag Cost", money(summ["effective_bag_cost"]),
           delta=money(summ["effective_bag_cost"] - bag_cost))
 k2.metric("Cost / gram", money(eff_cpg))
-k3.metric("Investment", money(summ["investment"]))
-k4.metric("Projected Profit", money(summ["total_profit"]))
-k5.metric("ROI", f"{summ['roi_pct']:.1f}%")
+k3.metric("Total Investment", money(summ["investment"] + total_variable_cost),
+          help="Stock cost + transport + other variable costs")
+k4.metric("Projected Profit", money(summ["total_profit"] - total_variable_cost))
+k5.metric("ROI (after var. costs)",
+          f"{((summ['total_profit'] - total_variable_cost) / (summ['investment'] + total_variable_cost) * 100) if (summ['investment'] + total_variable_cost) else 0:.1f}%")
+k6.metric("Cash Gap (days)", f"{days_cash_tied}d",
+          help="Days between paying supplier and receiving customer payment")
 
 st.divider()
 
@@ -170,8 +220,8 @@ st.divider()
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab1, tab2, tab3 = st.tabs(
-    ["📊 Unit Economics", "📦 First Order Mix", "📅 5-Week Sales Plan"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📊 Unit Economics", "📦 First Order Mix", "📅 5-Week Sales Plan", "💳 Cash Flow & Terms"]
 )
 
 with tab1:
@@ -275,6 +325,98 @@ with tab3:
                         mode="lines+markers", name="Cumulative Revenue")
         fig.update_layout(title="Cumulative Profit & Revenue Progression")
         st.plotly_chart(fig, use_container_width=True)
+
+with tab4:
+    st.subheader("💳 Cash Flow & Payment Terms Analysis")
+
+    # Summary cards
+    cf1, cf2, cf3, cf4 = st.columns(4)
+    cf1.metric("Supplier Term", payment_term, help="Days before you must pay supplier")
+    cf2.metric("Customer Term", customer_term, help="Days before customers pay you")
+    cf3.metric("Cash Gap", f"{days_cash_tied} days",
+               delta=f"{'-' if days_cash_tied == 0 else '+'}{days_cash_tied}d",
+               delta_color="inverse")
+    cf4.metric("Cash at Risk", money(cash_at_risk),
+               help="Total outlay before any revenue is collected")
+
+    st.divider()
+
+    # Variable cost breakdown
+    st.subheader("Variable Cost Breakdown")
+    vc1, vc2, vc3 = st.columns(3)
+    vc1.metric("Transport / Collection", money(transport_cost))
+    vc2.metric("Other Variable Costs", money(other_variable_cost))
+    vc3.metric("Total Variable Costs", money(total_variable_cost))
+
+    net_profit_after_vc = summ["total_profit"] - total_variable_cost
+    total_investment_with_vc = summ["investment"] + total_variable_cost
+    roi_after_vc = (net_profit_after_vc / total_investment_with_vc * 100) if total_investment_with_vc else 0
+
+    cost_breakdown_df = pd.DataFrame({
+        "Cost Component": ["Stock Cost", "Transport / Collection", "Other Variable Costs", "Packaging (all variants)"],
+        "Amount (R)": [
+            summ["investment"],
+            transport_cost,
+            other_variable_cost,
+            order_df["Cost (R)"].sum() - summ["investment"],
+        ],
+    })
+    cost_breakdown_df = cost_breakdown_df[cost_breakdown_df["Amount (R)"] > 0]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_vc = px.pie(
+            cost_breakdown_df, names="Cost Component", values="Amount (R)",
+            title="Total Cost Composition", hole=0.4,
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
+        st.plotly_chart(fig_vc, use_container_width=True)
+    with c2:
+        profit_waterfall = go.Figure(go.Waterfall(
+            name="Profit Waterfall",
+            orientation="v",
+            measure=["absolute", "relative", "relative", "total"],
+            x=["Revenue", "Stock Cost", "Variable Costs", "Net Profit"],
+            y=[summ["total_revenue"], -summ["investment"], -total_variable_cost, 0],
+            connector={"line": {"color": "rgb(63, 63, 63)"}},
+            decreasing={"marker": {"color": "#EF553B"}},
+            increasing={"marker": {"color": "#00CC96"}},
+            totals={"marker": {"color": "#636EFA"}},
+        ))
+        profit_waterfall.update_layout(title="Revenue → Net Profit Waterfall")
+        st.plotly_chart(profit_waterfall, use_container_width=True)
+
+    st.divider()
+
+    # Terms comparison table
+    st.subheader("Payment Terms Scenario Comparison")
+    scenarios = []
+    for sup_term, sup_days in TERM_DAYS.items():
+        for cust_term, cust_days in TERM_DAYS.items():
+            gap = max(0, cust_days - sup_days)
+            scenarios.append({
+                "Supplier Term": sup_term,
+                "Customer Term": cust_term,
+                "Cash Gap (days)": gap,
+                "Cash at Risk (R)": cash_at_risk if gap > 0 else 0,
+                "Net Profit (R)": round(net_profit_after_vc, 2),
+                "ROI %": round(roi_after_vc, 1),
+                "Favourable?": "✅ Yes" if gap == 0 else ("⚠️ Neutral" if gap <= 7 else "❌ No"),
+            })
+    scenarios_df = pd.DataFrame(scenarios)
+    st.dataframe(
+        scenarios_df.style.map(
+            lambda v: "color: green" if v == "✅ Yes" else ("color: orange" if v == "⚠️ Neutral" else "color: red"),
+            subset=["Favourable?"]
+        ),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.info(
+        f"**Current scenario:** Supplier = **{payment_term}** | Customer = **{customer_term}** | "
+        f"Cash gap = **{days_cash_tied} days** | Net profit after variable costs = **{money(net_profit_after_vc)}** | "
+        f"ROI = **{roi_after_vc:.1f}%**"
+    )
 
 # ---------------------------------------------------------------------------
 # Export

@@ -1,47 +1,90 @@
-# 💰 Pricing & Margin Model
+# Peony Washing Powder Pricing & Margin Model
 
-A professional Streamlit web app for a repackaging business that buys **5kg bags**
-from a supplier (Peony Trading @ R95/bag), receives **promotional free stock**
-(e.g. 5 free for every 50 ordered), and repackages the product into smaller
-retail variants.
+A Streamlit web app for modelling pricing, margins, first-order planning, and cash flow for a repackaging business.
+
+The app is designed for a business that:
+- buys `5kg` washing powder bags from a supplier,
+- receives promotional free stock,
+- repackages the product into smaller retail variants,
+- tracks profitability,
+- accounts for variable order costs like transport/collection,
+- and compares supplier/customer payment terms such as `7-day`, `14-day`, and `30-day`.
 
 ## Features
 
-- **Interactive sidebar inputs** — supplier bag cost, free-stock (% or "X free per Y"),
-  budget, order quantity, per-variant selling prices, packaging costs, and order mix.
-- **Three analysis tabs**
-  - **Unit Economics** — per-variant cost breakdown, profit, margin % and markup %.
-  - **First Order Mix** — recommended mix for fastest cash turnover, with ROI.
-  - **5-Week Sales Plan** — weekly targets and cumulative revenue/profit.
-- **Visual charts** (Plotly) — profit by variant, cost vs profit, margin comparison,
-  unit distribution, weekly revenue and cumulative progression.
-- **Exports** — full multi-sheet **Excel** workbook plus per-table **CSV** downloads.
-- **Effective costing** — free stock lowers the effective cost per bag and per gram.
+### Core pricing and margin analysis
+- Calculates effective bag cost after free promotional stock
+- Calculates cost per gram
+- Computes unit economics per product variant
+- Shows:
+  - product cost
+  - packaging cost
+  - total cost
+  - selling price
+  - profit per unit
+  - margin %
+  - markup %
 
-## Variants (defaults)
+### Order planning
+- Budget-based first order planning
+- Supports paid bags plus promotional free bags
+- Allows custom first-order mix allocation by variant
+- Shows:
+  - paid bags
+  - free bags
+  - total grams available
+  - grams used
+  - utilisation %
+  - total revenue
+  - total profit
 
-| Variant | Weight | Packaging | Sell |
-|---|---|---|---|
-| 100g Mini Sachet | 100g | R0.40 | R5.00 |
-| 200g Sachet | 200g | R0.70 | R9.50 |
-| 500g Pack | 500g | R1.20 | R21.00 |
-| 1kg Pack | 1000g | R1.80 | R36.00 |
-| 2kg Pack | 2000g | R2.50 | R60.00 |
-| 5kg Bulk | 5000g | R0.00 | R135.00 |
+### Variable cost tracking
+- Includes extra order-level costs such as:
+  - transport / collection
+  - other variable costs
+- Variable costs are incorporated into:
+  - total investment
+  - projected profit after variable costs
+  - ROI after variable costs
+  - cash-at-risk analysis
 
-> Product cost per gram is derived from the **effective** bag cost
-> (`bag_cost / (1 + free_fraction) / 5000`).
+### Payment terms analysis
+Supports supplier and customer payment terms:
+- Cash on Delivery
+- 7-Day
+- 14-Day
+- 30-Day
 
-## Run locally
+The app calculates:
+- supplier payment timing
+- customer collection timing
+- cash gap in days
+- cash at risk before revenue is collected
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+It also includes a payment terms scenario comparison table across all supplier/customer combinations.
 
-Then open http://localhost:8501 (or the port shown in the terminal).
+### Visualisations
+- Profit per unit by variant
+- Cost vs profit stacked chart
+- Margin % comparison
+- Unit distribution pie chart
+- Revenue composition chart
+- Weekly revenue targets
+- Cumulative revenue and profit trend
+- Cost composition pie chart
+- Revenue-to-net-profit waterfall chart
 
-## Files
-- `app.py` — Streamlit UI, charts, exports.
-- `logic.py` — pure business-logic calculations (testable, no UI).
-- `requirements.txt` — dependencies.
+### Export options
+- Excel workbook with multiple sheets
+- CSV export for:
+  - unit economics
+  - first order mix
+  - weekly sales plan
+
+## Project Structure
+
+```text
+pricing_margin_app/
+├── app.py
+├── logic.py
+└── README.md
