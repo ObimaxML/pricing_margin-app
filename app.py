@@ -12,6 +12,10 @@ from __future__ import annotations
 import io
 import random
 import re
+import base64
+from pathlib import Path
+
+from PIL import Image
 
 import pandas as pd
 import plotly.express as px
@@ -35,18 +39,66 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-        .main .block-container {padding-top: 2rem;}
-        h1, h2, h3 {color: #1f2a44;}
-        div[data-testid="stMetricValue"] {font-size: 1.6rem;}
-        .stTabs [data-baseweb="tab-list"] {gap: 8px;}
+        .main .block-container {
+            padding-top: 1rem;
+        }
+
+        h1, h2, h3 {
+            color: #1f2a44;
+        }
+
+        div[data-testid="stMetricValue"] {
+            font-size: 1.6rem;
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+        }
+
         .stTabs [data-baseweb="tab"] {
             background: #f0f2f6;
             border-radius: 8px 8px 0 0;
             padding: 10px 18px;
         }
+
         .stTabs [aria-selected="true"] {
             background: #1f77b4;
             color: white;
+        }
+
+        .peony-header {
+            width: 100%;
+            margin-bottom: 1rem;
+            border-radius: 18px;
+            overflow: hidden;
+            box-shadow: 0 8px 24px rgba(31, 42, 68, 0.16);
+            background: #ffffff;
+        }
+
+        .peony-header-img {
+            width: 100%;
+            display: block;
+            object-fit: cover;
+        }
+
+        .sidebar-logo-wrap {
+            width: 100%;
+            text-align: center;
+            padding: 0.6rem 0 1rem 0;
+            margin-bottom: 0.5rem;
+        }
+
+        .sidebar-logo-img {
+            width: 100%;
+            max-width: 260px;
+            border-radius: 12px;
+            background: white;
+            padding: 6px;
+            box-shadow: 0 4px 14px rgba(31, 42, 68, 0.12);
+        }
+
+        section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
         }
     </style>
     """,
@@ -55,6 +107,97 @@ st.markdown(
 
 CURRENCY = "R"
 FIVE_KG_GRAMS = 5000
+
+ASSETS_DIR = Path(__file__).parent / "assets"
+PEONY_BANNER_PATH = ASSETS_DIR / "peony_fresh_banner.png"
+
+
+def image_to_base64(image_path: Path) -> str:
+    """Converts an image file into a base64 string for HTML/CSS rendering."""
+
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode()
+
+
+def crop_logo_from_banner(
+    banner_path: Path,
+    output_path: Path,
+) -> Path:
+    """
+    Crops the central Peony Fresh logo from the full banner image
+    for use in the sidebar.
+    """
+
+    if output_path.exists():
+        return output_path
+
+    image = Image.open(banner_path)
+    width, height = image.size
+
+    # Crop central logo area from the Peony Fresh banner.
+    left = int(width * 0.27)
+    top = int(height * 0.05)
+    right = int(width * 0.73)
+    bottom = int(height * 0.95)
+
+    logo = image.crop((left, top, right, bottom))
+    logo.save(output_path)
+
+    return output_path
+
+
+def render_peony_header() -> None:
+    """Renders the full Peony Fresh banner at the top of the main app."""
+
+    if not PEONY_BANNER_PATH.exists():
+        st.warning(
+            "Peony Fresh banner image not found. "
+            "Please save it as assets/peony_fresh_banner.png"
+        )
+        return
+
+    banner_base64 = image_to_base64(PEONY_BANNER_PATH)
+
+    st.markdown(
+        f"""
+        <div class="peony-header">
+            <img src="data:image/png;base64,{banner_base64}" class="peony-header-img" />
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar_logo() -> None:
+    """Renders only the Peony Fresh logo in the sidebar."""
+
+    if not PEONY_BANNER_PATH.exists():
+        return
+
+    logo_path = ASSETS_DIR / "peony_fresh_logo.png"
+
+    try:
+        crop_logo_from_banner(
+            banner_path=PEONY_BANNER_PATH,
+            output_path=logo_path,
+        )
+
+        logo_base64 = image_to_base64(logo_path)
+
+        st.sidebar.markdown(
+            f"""
+            <div class="sidebar-logo-wrap">
+                <img src="data:image/png;base64,{logo_base64}" class="sidebar-logo-img" />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    except Exception:
+        st.sidebar.image(
+            str(PEONY_BANNER_PATH),
+            use_container_width=True,
+        )
 
 
 def money(x: float) -> str:
@@ -625,6 +768,8 @@ def set_mix_preset(
 # Sidebar inputs
 # ---------------------------------------------------------------------------
 
+render_sidebar_logo()
+
 st.sidebar.title("⚙️ Model Inputs")
 
 st.sidebar.subheader("Supplier & Stock")
@@ -1160,6 +1305,8 @@ def build_excel() -> bytes:
 # ---------------------------------------------------------------------------
 # Header & KPIs
 # ---------------------------------------------------------------------------
+
+render_peony_header()
 
 st.title("💰 Peony Washing Powder Pricing & Margin Model")
 
