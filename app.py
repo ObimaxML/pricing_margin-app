@@ -10,6 +10,8 @@ Run with: python -m streamlit run app.py
 from __future__ import annotations
 
 import io
+import random
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -52,6 +54,7 @@ st.markdown(
 )
 
 CURRENCY = "R"
+FIVE_KG_GRAMS = 5000
 
 
 def money(x: float) -> str:
@@ -61,6 +64,127 @@ def money(x: float) -> str:
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+def get_variant_grams(variant) -> float:
+    """
+    Determines variant size in grams.
+
+    Examples:
+    - 100g Mini Sachet -> 100
+    - 200g Sachet -> 200
+    - 500g Pack -> 500
+    - 1kg Pack -> 1000
+    - 2kg Pack -> 2000
+    - 5kg Bulk -> 5000
+    """
+
+    possible_attrs = [
+        "grams",
+        "size_g",
+        "weight_g",
+        "gram_weight",
+        "pack_size_g",
+        "unit_grams",
+    ]
+
+    for attr in possible_attrs:
+        if hasattr(variant, attr):
+            value = getattr(variant, attr)
+            if value is not None:
+                return float(value)
+
+    name = str(getattr(variant, "name", "")).lower()
+
+    kg_match = re.search(r"(\d+(?:\.\d+)?)\s*kg", name)
+    if kg_match:
+        return float(kg_match.group(1)) * 1000
+
+    g_match = re.search(r"(\d+(?:\.\d+)?)\s*g", name)
+    if g_match:
+        return float(g_match.group(1))
+
+    return 0.0
+
+
+def add_5kg_equivalent_column(
+    order_df: pd.DataFrame,
+    variants,
+) -> pd.DataFrame:
+    """
+    Adds a '5kg Packs Equivalent' column immediately after 'Units'.
+
+    Formula:
+    Units × variant grams / 5000
+    """
+
+    df = order_df.copy()
+
+    variant_gram_map = {
+        v.name: get_variant_grams(v)
+        for v in variants
+    }
+
+    if "Variant" not in df.columns or "Units" not in df.columns:
+        return df
+
+    df["5kg Packs Equivalent"] = df.apply(
+        lambda row: (
+            float(row["Units"]) * variant_gram_map.get(row["Variant"], 0.0)
+        ) / FIVE_KG_GRAMS,
+        axis=1,
+    )
+
+    cols = list(df.columns)
+
+    if "Units" in cols and "5kg Packs Equivalent" in cols:
+        cols.remove("5kg Packs Equivalent")
+        units_index = cols.index("Units")
+        cols.insert(units_index + 1, "5kg Packs Equivalent")
+        df = df[cols]
+
+    return df
+
+
+def build_mix_explanation(
+    order_df: pd.DataFrame,
+    variants,
+) -> pd.DataFrame:
+    """
+    Shows how total units are derived from grams and variant size.
+    """
+
+    df = order_df.copy()
+
+    variant_gram_map = {
+        v.name: get_variant_grams(v)
+        for v in variants
+    }
+
+    if "Variant" not in df.columns or "Units" not in df.columns:
+        return pd.DataFrame()
+
+    df["Variant Size (g)"] = df["Variant"].map(variant_gram_map)
+    df["Derived Grams Used"] = df["Units"] * df["Variant Size (g)"]
+    df["Formula"] = df.apply(
+        lambda row: (
+            f"{row['Derived Grams Used']:,.0f}g ÷ "
+            f"{row['Variant Size (g)']:,.0f}g = "
+            f"{row['Units']:,.0f} units"
+        ),
+        axis=1,
+    )
+
+    return df[
+        [
+            "Variant",
+            "Variant Size (g)",
+            "Units",
+            "5kg Packs Equivalent",
+            "Derived Grams Used",
+            "Formula",
+        ]
+    ]
+
 
 def adjustable_sales_plan(
     total_units: int,
@@ -72,12 +196,6 @@ def adjustable_sales_plan(
 ) -> pd.DataFrame:
     """
     Builds an adjustable weekly sales plan.
-
-    Supports:
-    - Even Split
-    - Slow Start / Ramp Up
-    - Fast Start
-    - Custom Weekly %
     """
 
     if weeks <= 0:
@@ -136,7 +254,6 @@ def adjustable_sales_plan(
 
     plan_df = pd.DataFrame(rows)
 
-    # Fix small rounding differences so total units match exactly
     if not plan_df.empty:
         unit_difference = total_units - int(plan_df["Units Target"].sum())
         plan_df.loc[plan_df.index[-1], "Units Target"] += unit_difference
@@ -145,119 +262,363 @@ def adjustable_sales_plan(
     return plan_df
 
 
-def build_outlet_allocation(
+def build_outlet_variant_allocation(
     outlet_names: list[str],
-    allocation_weights: list[float],
-    total_units: int,
-    total_revenue: float,
-    total_profit: float,
-) -> pd.DataFrame:
+    outlet_variant_units: dict[str, dict[str, int]],
+    variants,
+    order_df: pd.DataFrame,
+    ue_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Allocates total units, revenue and profit across outlets/channels.
+    Builds detailed outlet allocation by outlet, variant and number of units.
+
+    Returns:
+    1. outlet_detail_df  - outlet x variant allocation
+    2. outlet_summary_df - summary by outlet
+    3. variant_check_df  - available vs allocated by variant
     """
 
-    clean_rows = [
-        (name.strip(), weight)
-        for name, weight in zip(outlet_names, allocation_weights)
-        if name.strip()
+    clean_outlets = [
+        outlet.strip()
+        for outlet in outlet_names
+        if outlet.strip()
     ]
 
-    if not clean_rows:
-        return pd.DataFrame()
+    if not clean_outlets:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    clean_outlet_names = [row[0] for row in clean_rows]
-    clean_weights = [row[1] for row in clean_rows]
+    available_units_map = {}
 
-    total_weight = sum(clean_weights)
+    if "Variant" in order_df.columns and "Units" in order_df.columns:
+        available_units_map = dict(
+            zip(
+                order_df["Variant"],
+                order_df["Units"],
+            )
+        )
 
-    if total_weight == 0:
-        weights = [1 / len(clean_outlet_names)] * len(clean_outlet_names)
-    else:
-        weights = [w / total_weight for w in clean_weights]
+    cost_map = {}
+    sell_price_map = {}
+    profit_map = {}
+
+    if "Variant" in ue_df.columns:
+        if "Total Cost (R)" in ue_df.columns:
+            cost_map = dict(
+                zip(
+                    ue_df["Variant"],
+                    ue_df["Total Cost (R)"],
+                )
+            )
+
+        if "Sell Price (R)" in ue_df.columns:
+            sell_price_map = dict(
+                zip(
+                    ue_df["Variant"],
+                    ue_df["Sell Price (R)"],
+                )
+            )
+
+        if "Profit / Unit (R)" in ue_df.columns:
+            profit_map = dict(
+                zip(
+                    ue_df["Variant"],
+                    ue_df["Profit / Unit (R)"],
+                )
+            )
 
     rows = []
 
-    for outlet, weight in zip(clean_outlet_names, weights):
-        allocated_units = round(total_units * weight)
-        allocated_revenue = total_revenue * weight
-        allocated_profit = total_profit * weight
+    for outlet in clean_outlets:
+        variant_units = outlet_variant_units.get(outlet, {})
 
-        rows.append(
+        for v in variants:
+            variant_name = v.name
+            units_allocated = int(variant_units.get(variant_name, 0))
+            variant_grams = get_variant_grams(v)
+
+            sell_price = float(sell_price_map.get(variant_name, float(v.sell_price)))
+            unit_cost = float(cost_map.get(variant_name, 0.0))
+            profit_per_unit = float(profit_map.get(variant_name, sell_price - unit_cost))
+
+            revenue = units_allocated * sell_price
+            cost = units_allocated * unit_cost
+            profit = units_allocated * profit_per_unit
+            five_kg_equivalent = (units_allocated * variant_grams) / FIVE_KG_GRAMS
+
+            rows.append(
+                {
+                    "Outlet": outlet,
+                    "Variant": variant_name,
+                    "Variant Size (g)": variant_grams,
+                    "Units Allocated": units_allocated,
+                    "5kg Packs Equivalent": five_kg_equivalent,
+                    "Sell Price / Unit (R)": sell_price,
+                    "Cost / Unit (R)": unit_cost,
+                    "Profit / Unit (R)": profit_per_unit,
+                    "Revenue (R)": revenue,
+                    "Cost (R)": cost,
+                    "Profit (R)": profit,
+                }
+            )
+
+    outlet_detail_df = pd.DataFrame(rows)
+
+    if outlet_detail_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    outlet_summary_df = (
+        outlet_detail_df
+        .groupby("Outlet", as_index=False)
+        .agg(
             {
-                "Outlet": outlet,
-                "Allocation %": weight * 100,
-                "Units Allocated": allocated_units,
-                "Revenue (R)": allocated_revenue,
-                "Profit (R)": allocated_profit,
+                "Units Allocated": "sum",
+                "5kg Packs Equivalent": "sum",
+                "Revenue (R)": "sum",
+                "Cost (R)": "sum",
+                "Profit (R)": "sum",
+            }
+        )
+    )
+
+    variant_allocated_df = (
+        outlet_detail_df
+        .groupby("Variant", as_index=False)
+        .agg(
+            {
+                "Units Allocated": "sum",
+                "5kg Packs Equivalent": "sum",
+            }
+        )
+    )
+
+    variant_check_rows = []
+
+    for v in variants:
+        variant_name = v.name
+        available_units = int(available_units_map.get(variant_name, 0))
+
+        allocated_units_series = variant_allocated_df.loc[
+            variant_allocated_df["Variant"] == variant_name,
+            "Units Allocated",
+        ]
+
+        allocated_units = (
+            int(allocated_units_series.iloc[0])
+            if not allocated_units_series.empty
+            else 0
+        )
+
+        remaining_units = available_units - allocated_units
+
+        variant_grams = get_variant_grams(v)
+        allocated_5kg_equivalent = (allocated_units * variant_grams) / FIVE_KG_GRAMS
+        available_5kg_equivalent = (available_units * variant_grams) / FIVE_KG_GRAMS
+        remaining_5kg_equivalent = (remaining_units * variant_grams) / FIVE_KG_GRAMS
+
+        if remaining_units < 0:
+            status = "❌ Over-allocated"
+        elif remaining_units == 0:
+            status = "✅ Fully allocated"
+        else:
+            status = "⚠️ Remaining stock"
+
+        variant_check_rows.append(
+            {
+                "Variant": variant_name,
+                "Available Units": available_units,
+                "Allocated Units": allocated_units,
+                "Remaining Units": remaining_units,
+                "Available 5kg Equivalent": available_5kg_equivalent,
+                "Allocated 5kg Equivalent": allocated_5kg_equivalent,
+                "Remaining 5kg Equivalent": remaining_5kg_equivalent,
+                "Status": status,
             }
         )
 
-    outlet_df = pd.DataFrame(rows)
+    variant_check_df = pd.DataFrame(variant_check_rows)
 
-    # Fix rounding difference so total units match exactly
-    if not outlet_df.empty:
-        unit_difference = total_units - int(outlet_df["Units Allocated"].sum())
-        outlet_df.loc[outlet_df.index[-1], "Units Allocated"] += unit_difference
-
-    return outlet_df
+    return outlet_detail_df, outlet_summary_df, variant_check_df
 
 
 def build_competitor_pricing(
     variants,
-    omo_prices: dict[str, float],
-    avg_market_prices: dict[str, float],
+    competitor_names: list[str],
+    competitor_prices: dict[str, dict[str, float]],
 ) -> pd.DataFrame:
     """
-    Compares Peony selling prices against OMO and market average prices.
+    Compares Peony selling prices against one or more competitors.
+
+    R0 means that competitor does not sell that variant.
+    """
+
+    rows = []
+
+    clean_competitor_names = [
+        name.strip()
+        for name in competitor_names
+        if name.strip()
+    ]
+
+    for v in variants:
+        peony_price = float(v.sell_price)
+
+        row = {
+            "Variant": v.name,
+            "Peony Price (R)": peony_price,
+        }
+
+        active_competitor_prices = []
+
+        for competitor_name in clean_competitor_names:
+            competitor_price = float(
+                competitor_prices.get(competitor_name, {}).get(v.name, 0.0)
+            )
+
+            price_col = f"{competitor_name} Price (R)"
+            gap_col = f"Peony vs {competitor_name} Gap (R)"
+            gap_pct_col = f"Peony vs {competitor_name} Gap %"
+            position_col = f"Position vs {competitor_name}"
+
+            row[price_col] = competitor_price
+
+            if competitor_price > 0:
+                gap = peony_price - competitor_price
+                gap_pct = gap / competitor_price * 100
+
+                active_competitor_prices.append(competitor_price)
+
+                if peony_price < competitor_price:
+                    position = f"Cheaper than {competitor_name}"
+                elif peony_price == competitor_price:
+                    position = f"Same as {competitor_name}"
+                else:
+                    position = f"More expensive than {competitor_name}"
+            else:
+                gap = 0.0
+                gap_pct = 0.0
+                position = f"{competitor_name} not selling"
+
+            row[gap_col] = gap
+            row[gap_pct_col] = gap_pct
+            row[position_col] = position
+
+        if active_competitor_prices:
+            competitor_avg_price = sum(active_competitor_prices) / len(active_competitor_prices)
+            avg_gap = peony_price - competitor_avg_price
+            avg_gap_pct = avg_gap / competitor_avg_price * 100
+
+            if peony_price < competitor_avg_price:
+                avg_position = "Below competitor average"
+            elif peony_price == competitor_avg_price:
+                avg_position = "Equal to competitor average"
+            else:
+                avg_position = "Above competitor average"
+        else:
+            competitor_avg_price = 0.0
+            avg_gap = 0.0
+            avg_gap_pct = 0.0
+            avg_position = "No competitor price available"
+
+        row["Competitor Avg Price (R)"] = competitor_avg_price
+        row["Peony vs Competitor Avg Gap (R)"] = avg_gap
+        row["Peony vs Competitor Avg Gap %"] = avg_gap_pct
+        row["Position vs Competitor Avg"] = avg_position
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_competitor_chart_df(
+    variants,
+    competitor_names: list[str],
+    competitor_prices: dict[str, dict[str, float]],
+) -> pd.DataFrame:
+    """
+    Builds a long-form dataframe for grouped competitor price charts.
     """
 
     rows = []
 
     for v in variants:
-        peony_price = float(v.sell_price)
-        omo_price = float(omo_prices.get(v.name, 0))
-        avg_price = float(avg_market_prices.get(v.name, 0))
-
-        omo_gap = peony_price - omo_price if omo_price > 0 else 0
-        avg_gap = peony_price - avg_price if avg_price > 0 else 0
-
-        omo_gap_pct = (omo_gap / omo_price * 100) if omo_price > 0 else 0
-        avg_gap_pct = (avg_gap / avg_price * 100) if avg_price > 0 else 0
-
-        if omo_price <= 0:
-            omo_position = "No OMO price"
-        elif peony_price < omo_price:
-            omo_position = "Cheaper than OMO"
-        elif peony_price == omo_price:
-            omo_position = "Same as OMO"
-        else:
-            omo_position = "More expensive than OMO"
-
-        if avg_price <= 0:
-            avg_position = "No market avg"
-        elif peony_price < avg_price:
-            avg_position = "Below market avg"
-        elif peony_price == avg_price:
-            avg_position = "At market avg"
-        else:
-            avg_position = "Above market avg"
-
         rows.append(
             {
                 "Variant": v.name,
-                "Peony Price (R)": peony_price,
-                "OMO Price (R)": omo_price,
-                "Market Avg Price (R)": avg_price,
-                "Peony vs OMO Gap (R)": omo_gap,
-                "Peony vs OMO Gap %": omo_gap_pct,
-                "Peony vs Market Avg Gap (R)": avg_gap,
-                "Peony vs Market Avg Gap %": avg_gap_pct,
-                "OMO Position": omo_position,
-                "Market Position": avg_position,
+                "Brand": "Peony",
+                "Price (R)": float(v.sell_price),
             }
         )
 
+        for competitor_name in competitor_names:
+            clean_name = competitor_name.strip()
+
+            if not clean_name:
+                continue
+
+            price = float(
+                competitor_prices.get(clean_name, {}).get(v.name, 0.0)
+            )
+
+            if price > 0:
+                rows.append(
+                    {
+                        "Variant": v.name,
+                        "Brand": clean_name,
+                        "Price (R)": price,
+                    }
+                )
+
     return pd.DataFrame(rows)
+
+
+def set_mix_preset(
+    variants,
+    preset_name: str,
+) -> None:
+    """
+    Updates Streamlit session_state for first order mix sliders.
+    """
+
+    default_mix = {
+        "100g Mini Sachet": 30,
+        "200g Sachet": 25,
+        "500g Pack": 20,
+        "1kg Pack": 15,
+        "2kg Pack": 7,
+        "5kg Bulk": 3,
+    }
+
+    conservative_mix = {
+        "100g Mini Sachet": 5,
+        "200g Sachet": 10,
+        "500g Pack": 20,
+        "1kg Pack": 25,
+        "2kg Pack": 25,
+        "5kg Bulk": 15,
+    }
+
+    if preset_name == "reset":
+        selected_mix = default_mix
+
+    elif preset_name == "conservative":
+        selected_mix = conservative_mix
+
+    elif preset_name == "random":
+        random_values = [random.randint(0, 100) for _ in variants]
+
+        if sum(random_values) == 0:
+            random_values[0] = 100
+
+        selected_mix = {
+            v.name: random_values[i]
+            for i, v in enumerate(variants)
+        }
+
+    else:
+        selected_mix = default_mix
+
+    for v in variants:
+        st.session_state[f"mix_{v.name}"] = int(selected_mix.get(v.name, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +684,11 @@ budget = st.sidebar.number_input(
 )
 
 order_qty_bags = st.sidebar.number_input(
-    "Order quantity (paid bags)",
+    "Order quantity paid bags",
     min_value=1,
-    value=50,
+    value=60,
     step=1,
+    help="For example: 60 paid bags plus 10% free stock gives 66 total 5kg buckets.",
 )
 
 
@@ -404,60 +766,93 @@ for v in variants:
 
 
 # ---------------------------------------------------------------------------
-# Competitor pricing sidebar settings
+# Dynamic competitor pricing sidebar settings
 # ---------------------------------------------------------------------------
 
 st.sidebar.subheader("Competitor Pricing")
 
 st.sidebar.caption(
-    "Enter competitor prices for each variant. Use 0 if a competitor does not sell that exact size."
+    "Add one or more competitors. Enter R0 if a competitor does not sell a specific variant."
 )
 
-omo_prices = {}
-avg_market_prices = {}
+number_of_competitors = st.sidebar.number_input(
+    "Number of competitors",
+    min_value=1,
+    max_value=10,
+    value=3,
+    step=1,
+)
 
-default_omo_prices = {
-    "100g Mini Sachet": 0.0,
-    "200g Sachet": 0.0,
-    "500g Pack": 25.0,
-    "1kg Pack": 45.0,
-    "2kg Pack": 85.0,
-    "5kg Bulk": 180.0,
-}
+competitor_names = []
+competitor_prices: dict[str, dict[str, float]] = {}
 
-default_avg_market_prices = {
-    "100g Mini Sachet": 6.0,
-    "200g Sachet": 10.0,
-    "500g Pack": 22.0,
-    "1kg Pack": 40.0,
-    "2kg Pack": 75.0,
-    "5kg Bulk": 150.0,
-}
+default_competitor_names = [
+    "OMO",
+    "Sunlight",
+    "MAQ",
+    "Surf",
+    "Skip",
+    "Ariel",
+    "No Name",
+    "House Brand",
+    "Local Brand 1",
+    "Local Brand 2",
+]
 
-for v in variants:
-    with st.sidebar.expander(f"Competitor Prices — {v.name}", expanded=False):
-        omo_prices[v.name] = st.number_input(
-            f"OMO price (R) — {v.name}",
-            min_value=0.0,
-            value=float(default_omo_prices.get(v.name, 0.0)),
-            step=0.5,
-            key=f"omo_price_{v.name}",
-            help="Enter 0 if OMO does not sell this exact pack size.",
-        )
+for competitor_index in range(number_of_competitors):
+    default_competitor_name = (
+        default_competitor_names[competitor_index]
+        if competitor_index < len(default_competitor_names)
+        else f"Competitor {competitor_index + 1}"
+    )
 
-        avg_market_prices[v.name] = st.number_input(
-            f"Average market price (R) — {v.name}",
-            min_value=0.0,
-            value=float(default_avg_market_prices.get(v.name, 0.0)),
-            step=0.5,
-            key=f"avg_market_price_{v.name}",
-            help="Average selling price across competing brands or nearby outlets.",
-        )
+    with st.sidebar.expander(
+        f"Competitor {competitor_index + 1}",
+        expanded=False,
+    ):
+        competitor_name = st.text_input(
+            f"Competitor name {competitor_index + 1}",
+            value=default_competitor_name,
+            key=f"competitor_name_{competitor_index}",
+        ).strip()
 
+        if not competitor_name:
+            competitor_name = f"Competitor {competitor_index + 1}"
+
+        competitor_names.append(competitor_name)
+        competitor_prices[competitor_name] = {}
+
+        for v in variants:
+            competitor_prices[competitor_name][v.name] = st.number_input(
+                f"{competitor_name} price (R) — {v.name}",
+                min_value=0.0,
+                value=0.0,
+                step=0.5,
+                key=f"competitor_{competitor_index}_price_{v.name}",
+                help="Enter 0 if this competitor does not sell this exact pack size.",
+            )
+
+
+# ---------------------------------------------------------------------------
+# First Order Mix with preset buttons
+# ---------------------------------------------------------------------------
 
 st.sidebar.subheader("First Order Mix (%)")
 
-mix_weights = {}
+st.sidebar.caption(
+    "Use the buttons to auto-fill the mix sliders. The model will normalise the values."
+)
+
+mix_button_1, mix_button_2, mix_button_3 = st.sidebar.columns(3)
+
+if mix_button_1.button("🎲 Random"):
+    set_mix_preset(variants, "random")
+
+if mix_button_2.button("🛡️ Conservative"):
+    set_mix_preset(variants, "conservative")
+
+if mix_button_3.button("🔄 Reset"):
+    set_mix_preset(variants, "reset")
 
 default_mix = {
     "100g Mini Sachet": 30,
@@ -468,13 +863,19 @@ default_mix = {
     "5kg Bulk": 3,
 }
 
+mix_weights = {}
+
 for v in variants:
+    mix_key = f"mix_{v.name}"
+
+    if mix_key not in st.session_state:
+        st.session_state[mix_key] = int(default_mix.get(v.name, 0))
+
     mix_weights[v.name] = st.sidebar.slider(
         v.name,
         0,
         100,
-        default_mix.get(v.name, 0),
-        key=f"mix_{v.name}",
+        key=mix_key,
     )
 
 
@@ -531,6 +932,11 @@ if sales_pattern == "Custom Weekly %":
 
 st.sidebar.subheader("Outlet Allocation")
 
+st.sidebar.caption(
+    "Allocate exact units per outlet and per variant. "
+    "Use 0 where an outlet will not receive that variant."
+)
+
 number_of_outlets = st.sidebar.number_input(
     "Number of outlets / channels",
     min_value=1,
@@ -541,7 +947,7 @@ number_of_outlets = st.sidebar.number_input(
 )
 
 outlet_names = []
-outlet_allocation_weights = []
+outlet_variant_units: dict[str, dict[str, int]] = {}
 
 default_outlets = [
     "IML Convenience Store",
@@ -549,35 +955,40 @@ default_outlets = [
     "Direct Household Sales",
 ]
 
-for i in range(number_of_outlets):
+for outlet_index in range(number_of_outlets):
     default_name = (
-        default_outlets[i]
-        if i < len(default_outlets)
-        else f"Outlet {i + 1}"
+        default_outlets[outlet_index]
+        if outlet_index < len(default_outlets)
+        else f"Outlet {outlet_index + 1}"
     )
 
-    with st.sidebar.expander(f"Outlet / Channel {i + 1}", expanded=False):
+    with st.sidebar.expander(
+        f"Outlet / Channel {outlet_index + 1}",
+        expanded=False,
+    ):
         outlet_name = st.text_input(
-            f"Outlet name {i + 1}",
+            f"Outlet name {outlet_index + 1}",
             value=default_name,
-            key=f"outlet_name_{i}",
-        )
+            key=f"outlet_name_{outlet_index}",
+        ).strip()
 
-        outlet_weight = st.number_input(
-            f"Allocation weight {i + 1}",
-            min_value=0.0,
-            max_value=100.0,
-            value=round(100 / number_of_outlets, 1),
-            step=1.0,
-            key=f"outlet_weight_{i}",
-            help=(
-                "This does not need to total 100%. "
-                "The app will normalise all outlet weights."
-            ),
-        )
+        if not outlet_name:
+            outlet_name = f"Outlet {outlet_index + 1}"
 
         outlet_names.append(outlet_name)
-        outlet_allocation_weights.append(outlet_weight)
+        outlet_variant_units[outlet_name] = {}
+
+        st.caption("Enter units allocated to this outlet per variant.")
+
+        for v in variants:
+            outlet_variant_units[outlet_name][v.name] = st.number_input(
+                f"{outlet_name} units — {v.name}",
+                min_value=0,
+                value=0,
+                step=1,
+                key=f"outlet_{outlet_index}_units_{v.name}",
+                help="Number of units of this variant allocated to this outlet.",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +1012,17 @@ order = logic.first_order_mix(
 )
 
 order_df = order["table"]
+
+order_df = add_5kg_equivalent_column(
+    order_df=order_df,
+    variants=variants,
+)
+
+mix_explanation_df = build_mix_explanation(
+    order_df=order_df,
+    variants=variants,
+)
+
 summ = order["summary"]
 
 total_units = int(order_df["Units"].sum())
@@ -616,18 +1038,24 @@ plan_df = adjustable_sales_plan(
     custom_weights=custom_weekly_weights,
 )
 
-outlet_df = build_outlet_allocation(
+outlet_detail_df, outlet_summary_df, outlet_variant_check_df = build_outlet_variant_allocation(
     outlet_names=outlet_names,
-    allocation_weights=outlet_allocation_weights,
-    total_units=total_units,
-    total_revenue=summ["total_revenue"],
-    total_profit=net_profit_after_variable_costs,
+    outlet_variant_units=outlet_variant_units,
+    variants=variants,
+    order_df=order_df,
+    ue_df=ue_df,
 )
 
 competitor_df = build_competitor_pricing(
     variants=variants,
-    omo_prices=omo_prices,
-    avg_market_prices=avg_market_prices,
+    competitor_names=competitor_names,
+    competitor_prices=competitor_prices,
+)
+
+competitor_chart_df = build_competitor_chart_df(
+    variants=variants,
+    competitor_names=competitor_names,
+    competitor_prices=competitor_prices,
 )
 
 eff_cpg = logic.cost_per_gram(
@@ -659,6 +1087,12 @@ def build_excel() -> bytes:
             index=False,
         )
 
+        mix_explanation_df.to_excel(
+            writer,
+            sheet_name="Mix Explanation",
+            index=False,
+        )
+
         pd.DataFrame([summ]).to_excel(
             writer,
             sheet_name="Order Summary",
@@ -671,9 +1105,21 @@ def build_excel() -> bytes:
             index=False,
         )
 
-        outlet_df.to_excel(
+        outlet_summary_df.to_excel(
             writer,
-            sheet_name="Outlet Allocation",
+            sheet_name="Outlet Summary",
+            index=False,
+        )
+
+        outlet_detail_df.to_excel(
+            writer,
+            sheet_name="Outlet Detail",
+            index=False,
+        )
+
+        outlet_variant_check_df.to_excel(
+            writer,
+            sheet_name="Outlet Variant Check",
             index=False,
         )
 
@@ -719,8 +1165,8 @@ st.title("💰 Peony Washing Powder Pricing & Margin Model")
 
 st.caption(
     "Buy 5kg bags • receive promotional free stock • repackage into retail "
-    "variants • compare competitor prices • track outlet allocation, cash turnover "
-    "and an adjustable weekly sales plan."
+    "variants • compare competitor prices • allocate exact stock units to outlets • "
+    "track cash turnover and an adjustable weekly sales plan."
 )
 
 k1, k2, k3, k4, k5, k6 = st.columns(6)
@@ -877,7 +1323,7 @@ with tab1:
 with tab2:
     st.subheader("Recommended First Order Mix")
 
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3, s4, s5 = st.columns(5)
 
     s1.metric(
         "Paid Bags",
@@ -890,11 +1336,16 @@ with tab2:
     )
 
     s3.metric(
+        "Total 5kg Buckets",
+        f"{summ['paid_bags'] + summ['free_bags']}",
+    )
+
+    s4.metric(
         "Total Revenue",
         money(summ["total_revenue"]),
     )
 
-    s4.metric(
+    s5.metric(
         "Total Profit before var. costs",
         money(summ["total_profit"]),
     )
@@ -909,6 +1360,7 @@ with tab2:
         order_df.style.format(
             {
                 "Mix %": "{:.1f}",
+                "5kg Packs Equivalent": "{:.1f}",
                 "Revenue (R)": "{:.2f}",
                 "Cost (R)": "{:.2f}",
                 "Profit (R)": "{:.2f}",
@@ -917,6 +1369,34 @@ with tab2:
         use_container_width=True,
         hide_index=True,
     )
+
+    total_5kg_equivalent = order_df["5kg Packs Equivalent"].sum()
+
+    st.info(
+        f"Grams available: **{summ['grams_available']:,} g** • "
+        f"Grams used: **{summ['grams_used']:,} g** • "
+        f"Utilisation: **{(summ['grams_used'] / summ['grams_available'] * 100) if summ['grams_available'] else 0:.1f}%** • "
+        f"Total units: **{total_units:,}** • "
+        f"Total 5kg pack equivalent used: **{total_5kg_equivalent:.1f}**"
+    )
+
+    with st.expander("How the total units are calculated", expanded=True):
+        st.write(
+            "Each line converts allocated grams into units. "
+            "For example, 25,500g allocated to 500g packs gives 51 units."
+        )
+
+        st.dataframe(
+            mix_explanation_df.style.format(
+                {
+                    "Variant Size (g)": "{:.0f}",
+                    "5kg Packs Equivalent": "{:.1f}",
+                    "Derived Grams Used": "{:.0f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     c1, c2 = st.columns(2)
 
@@ -947,12 +1427,6 @@ with tab2:
             fig,
             use_container_width=True,
         )
-
-    st.info(
-        f"Grams available: **{summ['grams_available']:,} g** • "
-        f"Grams used: **{summ['grams_used']:,} g** • "
-        f"Utilisation: **{(summ['grams_used'] / summ['grams_available'] * 100) if summ['grams_available'] else 0:.1f}%**"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1145,35 +1619,73 @@ with tab4:
     st.subheader("🏪 Outlet / Channel Allocation")
 
     st.caption(
-        "Allocate stock, revenue and profit across outlets or sales channels. "
-        "The allocation weights are normalised automatically."
+        "Allocate exact units by outlet and variant. "
+        "This section checks whether you have under-allocated or over-allocated stock."
     )
 
-    if outlet_df.empty:
-        st.warning("No outlet allocation available.")
+    if outlet_detail_df.empty:
+        st.warning("No outlet allocation entered yet. Add outlet units in the sidebar.")
     else:
-        o1, o2, o3 = st.columns(3)
+        total_allocated_units = int(outlet_detail_df["Units Allocated"].sum())
+        total_allocated_5kg_equiv = outlet_detail_df["5kg Packs Equivalent"].sum()
+        total_allocated_profit = outlet_detail_df["Profit (R)"].sum()
+
+        total_available_units = int(order_df["Units"].sum())
+        total_available_5kg_equiv = order_df["5kg Packs Equivalent"].sum()
+
+        remaining_units = total_available_units - total_allocated_units
+        remaining_5kg_equiv = total_available_5kg_equiv - total_allocated_5kg_equiv
+
+        o1, o2, o3, o4, o5 = st.columns(5)
 
         o1.metric(
-            "Total Outlets / Channels",
-            len(outlet_df),
+            "Available Units",
+            f"{total_available_units:,}",
         )
 
         o2.metric(
-            "Total Units Allocated",
-            f"{int(outlet_df['Units Allocated'].sum()):,}",
+            "Allocated Units",
+            f"{total_allocated_units:,}",
         )
 
         o3.metric(
-            "Total Projected Profit",
-            money(outlet_df["Profit (R)"].sum()),
+            "Remaining Units",
+            f"{remaining_units:,}",
         )
 
+        o4.metric(
+            "Allocated 5kg Equiv.",
+            f"{total_allocated_5kg_equiv:.1f}",
+        )
+
+        o5.metric(
+            "Projected Profit",
+            money(total_allocated_profit),
+        )
+
+        if remaining_units < 0:
+            st.error(
+                "You have allocated more units than are available. "
+                "Check the variant allocation table below."
+            )
+        elif remaining_units == 0:
+            st.success("All available units have been fully allocated.")
+        else:
+            st.warning(
+                f"You still have **{remaining_units:,} units** remaining, "
+                f"equal to **{remaining_5kg_equiv:.1f} × 5kg packs**."
+            )
+
+        st.divider()
+
+        st.subheader("Outlet Summary")
+
         st.dataframe(
-            outlet_df.style.format(
+            outlet_summary_df.style.format(
                 {
-                    "Allocation %": "{:.1f}%",
+                    "5kg Packs Equivalent": "{:.1f}",
                     "Revenue (R)": "{:.2f}",
+                    "Cost (R)": "{:.2f}",
                     "Profit (R)": "{:.2f}",
                 }
             ),
@@ -1184,12 +1696,16 @@ with tab4:
         c1, c2 = st.columns(2)
 
         with c1:
-            fig_outlet_units = px.pie(
-                outlet_df,
-                names="Outlet",
-                values="Units Allocated",
+            fig_outlet_units = px.bar(
+                outlet_summary_df,
+                x="Outlet",
+                y="Units Allocated",
                 title="Units Allocated by Outlet",
-                hole=0.4,
+                text="Units Allocated",
+            )
+
+            fig_outlet_units.update_traces(
+                textposition="outside",
             )
 
             st.plotly_chart(
@@ -1199,7 +1715,7 @@ with tab4:
 
         with c2:
             fig_outlet_profit = px.bar(
-                outlet_df,
+                outlet_summary_df,
                 x="Outlet",
                 y="Profit (R)",
                 title="Projected Profit by Outlet",
@@ -1216,10 +1732,66 @@ with tab4:
                 use_container_width=True,
             )
 
-        st.info(
-            f"Current allocation total: **{outlet_df['Allocation %'].sum():.1f}%** "
-            "after normalisation."
+        st.divider()
+
+        st.subheader("Detailed Outlet × Variant Allocation")
+
+        st.dataframe(
+            outlet_detail_df.style.format(
+                {
+                    "Variant Size (g)": "{:.0f}",
+                    "5kg Packs Equivalent": "{:.1f}",
+                    "Sell Price / Unit (R)": "{:.2f}",
+                    "Cost / Unit (R)": "{:.2f}",
+                    "Profit / Unit (R)": "{:.2f}",
+                    "Revenue (R)": "{:.2f}",
+                    "Cost (R)": "{:.2f}",
+                    "Profit (R)": "{:.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
         )
+
+        st.divider()
+
+        st.subheader("Variant Allocation Check")
+
+        st.caption(
+            "This table compares the units generated in the First Order Mix "
+            "against the units allocated to outlets."
+        )
+
+        st.dataframe(
+            outlet_variant_check_df.style.format(
+                {
+                    "Available 5kg Equivalent": "{:.1f}",
+                    "Allocated 5kg Equivalent": "{:.1f}",
+                    "Remaining 5kg Equivalent": "{:.1f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        over_allocated = outlet_variant_check_df[
+            outlet_variant_check_df["Remaining Units"] < 0
+        ]
+
+        if not over_allocated.empty:
+            st.error(
+                "Some variants are over-allocated. Reduce outlet units for the variants marked ❌."
+            )
+
+        remaining_stock = outlet_variant_check_df[
+            outlet_variant_check_df["Remaining Units"] > 0
+        ]
+
+        if not remaining_stock.empty:
+            st.info(
+                "Some variants still have remaining stock. You can allocate them to outlets "
+                "or keep them as reserve stock."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1230,21 +1802,29 @@ with tab5:
     st.subheader("🏷️ Competitor Pricing Comparison")
 
     st.caption(
-        "Compare Peony selling prices against OMO and average market selling prices."
+        "Compare Peony selling prices against one or more competitors. "
+        "Competitor prices entered as R0 are treated as not selling that variant."
     )
 
+    format_dict = {
+        "Peony Price (R)": "{:.2f}",
+        "Competitor Avg Price (R)": "{:.2f}",
+        "Peony vs Competitor Avg Gap (R)": "{:.2f}",
+        "Peony vs Competitor Avg Gap %": "{:.1f}%",
+    }
+
+    for competitor_name in competitor_names:
+        clean_name = competitor_name.strip()
+
+        if not clean_name:
+            continue
+
+        format_dict[f"{clean_name} Price (R)"] = "{:.2f}"
+        format_dict[f"Peony vs {clean_name} Gap (R)"] = "{:.2f}"
+        format_dict[f"Peony vs {clean_name} Gap %"] = "{:.1f}%"
+
     st.dataframe(
-        competitor_df.style.format(
-            {
-                "Peony Price (R)": "{:.2f}",
-                "OMO Price (R)": "{:.2f}",
-                "Market Avg Price (R)": "{:.2f}",
-                "Peony vs OMO Gap (R)": "{:.2f}",
-                "Peony vs OMO Gap %": "{:.1f}%",
-                "Peony vs Market Avg Gap (R)": "{:.2f}",
-                "Peony vs Market Avg Gap %": "{:.1f}%",
-            }
-        ),
+        competitor_df.style.format(format_dict),
         use_container_width=True,
         hide_index=True,
     )
@@ -1252,51 +1832,45 @@ with tab5:
     c1, c2 = st.columns(2)
 
     with c1:
-        fig_comp_prices = go.Figure()
+        if competitor_chart_df.empty:
+            st.warning("No competitor chart data available yet.")
+        else:
+            fig_comp_prices = px.bar(
+                competitor_chart_df,
+                x="Variant",
+                y="Price (R)",
+                color="Brand",
+                barmode="group",
+                title="Peony vs Competitor Prices by Variant",
+                text="Price (R)",
+            )
 
-        fig_comp_prices.add_bar(
-            name="Peony",
-            x=competitor_df["Variant"],
-            y=competitor_df["Peony Price (R)"],
-        )
+            fig_comp_prices.update_traces(
+                texttemplate="R%{text:.2f}",
+                textposition="outside",
+            )
 
-        fig_comp_prices.add_bar(
-            name="OMO",
-            x=competitor_df["Variant"],
-            y=competitor_df["OMO Price (R)"],
-        )
-
-        fig_comp_prices.add_bar(
-            name="Market Avg",
-            x=competitor_df["Variant"],
-            y=competitor_df["Market Avg Price (R)"],
-        )
-
-        fig_comp_prices.update_layout(
-            title="Peony vs OMO vs Market Average Price",
-            barmode="group",
-            yaxis_title="Selling Price (R)",
-        )
-
-        st.plotly_chart(
-            fig_comp_prices,
-            use_container_width=True,
-        )
+            st.plotly_chart(
+                fig_comp_prices,
+                use_container_width=True,
+            )
 
     with c2:
-        fig_gap = px.bar(
+        fig_avg_gap = px.bar(
             competitor_df,
             x="Variant",
-            y=[
-                "Peony vs OMO Gap (R)",
-                "Peony vs Market Avg Gap (R)",
-            ],
-            title="Price Gap: Peony vs Competitors",
-            barmode="group",
+            y="Peony vs Competitor Avg Gap (R)",
+            title="Peony Price Gap vs Competitor Average",
+            text="Peony vs Competitor Avg Gap (R)",
+        )
+
+        fig_avg_gap.update_traces(
+            texttemplate="R%{text:.2f}",
+            textposition="outside",
         )
 
         st.plotly_chart(
-            fig_gap,
+            fig_avg_gap,
             use_container_width=True,
         )
 
@@ -1304,43 +1878,47 @@ with tab5:
 
     st.subheader("Pricing Position Summary")
 
-    cheaper_than_omo = competitor_df[
-        competitor_df["OMO Position"] == "Cheaper than OMO"
+    below_avg_count = competitor_df[
+        competitor_df["Position vs Competitor Avg"] == "Below competitor average"
     ].shape[0]
 
-    more_expensive_than_omo = competitor_df[
-        competitor_df["OMO Position"] == "More expensive than OMO"
+    above_avg_count = competitor_df[
+        competitor_df["Position vs Competitor Avg"] == "Above competitor average"
     ].shape[0]
 
-    cheaper_than_market = competitor_df[
-        competitor_df["Market Position"] == "Below market avg"
+    equal_avg_count = competitor_df[
+        competitor_df["Position vs Competitor Avg"] == "Equal to competitor average"
+    ].shape[0]
+
+    no_price_count = competitor_df[
+        competitor_df["Position vs Competitor Avg"] == "No competitor price available"
     ].shape[0]
 
     p1, p2, p3, p4 = st.columns(4)
 
     p1.metric(
-        "Cheaper than OMO",
-        cheaper_than_omo,
+        "Below Competitor Avg",
+        below_avg_count,
     )
 
     p2.metric(
-        "More Expensive than OMO",
-        more_expensive_than_omo,
+        "Above Competitor Avg",
+        above_avg_count,
     )
 
     p3.metric(
-        "Below Market Avg",
-        cheaper_than_market,
+        "Equal to Avg",
+        equal_avg_count,
     )
 
     p4.metric(
-        "Total Variants Compared",
-        len(competitor_df),
+        "No Competitor Price",
+        no_price_count,
     )
 
     st.info(
-        "Use this tab to decide whether Peony should be positioned as a budget, "
-        "value-for-money, or direct competitor to premium brands like OMO."
+        "Use this tab to test whether Peony is positioned as a budget, "
+        "value-for-money, or premium-priced product versus the competitors you enter."
     )
 
 
@@ -1552,7 +2130,7 @@ st.divider()
 
 st.subheader("⬇️ Export Calculations")
 
-e1, e2, e3, e4, e5, e6 = st.columns(6)
+e1, e2, e3, e4, e5, e6, e7 = st.columns(7)
 
 e1.download_button(
     "📗 Excel all sheets",
@@ -1576,20 +2154,27 @@ e3.download_button(
 )
 
 e4.download_button(
+    "🧮 Mix Explanation CSV",
+    mix_explanation_df.to_csv(index=False),
+    "mix_explanation.csv",
+    "text/csv",
+)
+
+e5.download_button(
     f"📄 {plan_weeks}-Week Plan CSV",
     plan_df.to_csv(index=False),
     f"{plan_weeks}_week_plan.csv",
     "text/csv",
 )
 
-e5.download_button(
-    "🏪 Outlet Allocation CSV",
-    outlet_df.to_csv(index=False),
-    "outlet_allocation.csv",
+e6.download_button(
+    "🏪 Outlet Detail CSV",
+    outlet_detail_df.to_csv(index=False),
+    "outlet_detail_allocation.csv",
     "text/csv",
 )
 
-e6.download_button(
+e7.download_button(
     "🏷️ Competitor Pricing CSV",
     competitor_df.to_csv(index=False),
     "competitor_pricing.csv",
