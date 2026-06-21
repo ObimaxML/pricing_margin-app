@@ -849,7 +849,7 @@ else:
 
 st.sidebar.subheader("Order & Budget")
 
-init_state("budget", 5000.0, saved_session)
+init_state("budget", 7000.0, saved_session)
 budget = st.sidebar.number_input(
     "Budget (R)",
     min_value=0.0,
@@ -870,7 +870,7 @@ order_qty_bags = st.sidebar.number_input(
 
 st.sidebar.subheader("Variable Costs")
 
-init_state("transport_cost", 150.0, saved_session)
+init_state("transport_cost", 500.0, saved_session)
 transport_cost = st.sidebar.number_input(
     "Transport / collection cost (R per order)",
     min_value=0.0,
@@ -879,7 +879,7 @@ transport_cost = st.sidebar.number_input(
     help="Fuel, delivery, or collection cost for the entire order.",
 )
 
-init_state("other_variable_cost", 0.0, saved_session)
+init_state("other_variable_cost", 300.0, saved_session)
 other_variable_cost = st.sidebar.number_input(
     "Other variable costs (R per order)",
     min_value=0.0,
@@ -1043,12 +1043,12 @@ if mix_button_3.button("🔄 Reset"):
     set_mix_preset(variants, "reset")
 
 default_mix = {
-    "100g Mini Sachet": 30,
-    "200g Sachet": 25,
-    "500g Pack": 20,
-    "1kg Pack": 15,
-    "2kg Pack": 7,
-    "5kg Bulk": 3,
+    "100g Mini Sachet": 20,
+    "200g Sachet": 40,
+    "500g Pack": 15,
+    "1kg Pack": 10,
+    "2kg Pack": 10,
+    "5kg Bulk": 5,
 }
 
 mix_weights = {}
