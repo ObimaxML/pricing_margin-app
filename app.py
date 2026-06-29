@@ -15,6 +15,7 @@ import random
 import re
 from pathlib import Path
 from typing import Any
+from datetime import date, datetime
 
 import pandas as pd
 import plotly.express as px
@@ -31,6 +32,7 @@ import logic
 CURRENCY = "R"
 FIVE_KG_GRAMS = 5000
 SESSION_FILE = Path(__file__).with_name("peony_pricing_session.json")
+CAMPAIGN_FILE = Path(__file__).with_name("peony_marketing_campaigns.json")
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +108,306 @@ def init_state(key: str, default: Any, saved_session: dict[str, Any]) -> None:
         st.session_state[key] = saved_session.get(key, default)
 
 
+# ---------------------------------------------------------------------------
+# Campaign persistence helpers
+# ---------------------------------------------------------------------------
+
+def load_campaigns() -> dict[str, Any]:
+    """
+    Loads saved marketing campaigns and sales records from a local JSON file.
+
+    Structure:
+    {
+        "Campaign Name": {
+            "name": "Campaign Name",
+            "start_date": "YYYY-MM-DD",
+            "end_date": "YYYY-MM-DD",
+            "sales_records": [...]
+        }
+    }
+    """
+    if not CAMPAIGN_FILE.exists():
+        return {}
+
+    try:
+        with CAMPAIGN_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_campaigns(campaigns: dict[str, Any]) -> None:
+    with CAMPAIGN_FILE.open("w", encoding="utf-8") as f:
+        json.dump(campaigns, f, indent=2)
+
+
+def date_to_iso(value: Any) -> str:
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if isinstance(value, str):
+        return value
+
+    return date.today().isoformat()
+
+
+def iso_to_date(value: Any, fallback: date | None = None) -> date:
+    if fallback is None:
+        fallback = date.today()
+
+    if isinstance(value, date):
+        return value
+
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError:
+            return fallback
+
+    return fallback
+
+
+def get_campaign_options(campaigns: dict[str, Any]) -> list[str]:
+    return sorted(campaigns.keys())
+
+
+def upsert_campaign(
+    campaigns: dict[str, Any],
+    campaign_name: str,
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    clean_name = campaign_name.strip()
+
+    if not clean_name:
+        return campaigns
+
+    existing_campaign = campaigns.get(clean_name, {})
+
+    campaigns[clean_name] = {
+        "name": clean_name,
+        "start_date": date_to_iso(start_date),
+        "end_date": date_to_iso(end_date),
+        "sales_records": existing_campaign.get("sales_records", []),
+    }
+
+    return campaigns
+
+
+def add_campaign_sale(
+    campaigns: dict[str, Any],
+    campaign_name: str,
+    sale_date: date,
+    outlet: str,
+    variant: str,
+    units_sold: int,
+    sell_price: float,
+    notes: str = "",
+) -> dict[str, Any]:
+    clean_name = campaign_name.strip()
+
+    if clean_name not in campaigns:
+        return campaigns
+
+    revenue = float(units_sold) * float(sell_price)
+
+    campaigns[clean_name].setdefault("sales_records", []).append(
+        {
+            "sale_id": f"SALE-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random.randint(1000, 9999)}",
+            "sale_date": date_to_iso(sale_date),
+            "outlet": outlet,
+            "variant": variant,
+            "units_sold": int(units_sold),
+            "sell_price": float(sell_price),
+            "revenue": revenue,
+            "notes": notes.strip(),
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+
+    return campaigns
+
+
+
+
+def delete_campaign_sale_at_index(
+    campaigns: dict[str, Any],
+    campaign_name: str,
+    record_index: int,
+) -> dict[str, Any]:
+    clean_name = campaign_name.strip()
+
+    if clean_name not in campaigns:
+        return campaigns
+
+    records = campaigns[clean_name].get("sales_records", [])
+
+    if not isinstance(records, list):
+        campaigns[clean_name]["sales_records"] = []
+        return campaigns
+
+    if 0 <= int(record_index) < len(records):
+        records.pop(int(record_index))
+
+    campaigns[clean_name]["sales_records"] = records
+    return campaigns
+
+
+def clear_campaign_sales(
+    campaigns: dict[str, Any],
+    campaign_name: str,
+) -> dict[str, Any]:
+    clean_name = campaign_name.strip()
+
+    if clean_name in campaigns:
+        campaigns[clean_name]["sales_records"] = []
+
+    return campaigns
+
+def build_campaign_sales_df(campaign: dict[str, Any] | None) -> pd.DataFrame:
+    if not campaign:
+        return pd.DataFrame()
+
+    records = campaign.get("sales_records", [])
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    if "sale_date" in df.columns:
+        df["sale_date"] = pd.to_datetime(df["sale_date"], errors="coerce").dt.date
+
+    if "units_sold" in df.columns:
+        df["units_sold"] = df["units_sold"].fillna(0).astype(int)
+
+    if "sell_price" in df.columns:
+        df["sell_price"] = df["sell_price"].fillna(0.0).astype(float)
+
+    if "revenue" in df.columns:
+        df["revenue"] = df["revenue"].fillna(0.0).astype(float)
+
+    return df
+
+
+def build_campaign_progress(
+    campaign: dict[str, Any] | None,
+    order_df: pd.DataFrame,
+    outlet_detail_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns two views:
+    1. variant_progress_df: planned/available units vs actual campaign sales.
+    2. outlet_progress_df: allocated outlet units vs actual outlet sales.
+    """
+    campaign_sales_df = build_campaign_sales_df(campaign)
+
+    if order_df.empty or "Variant" not in order_df.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    available_df = order_df[["Variant", "Units"]].copy()
+    available_df = available_df.rename(columns={"Units": "Available Units"})
+
+    if campaign_sales_df.empty:
+        sold_by_variant = pd.DataFrame(columns=["Variant", "Units Sold", "Actual Revenue (R)"])
+        sold_by_outlet = pd.DataFrame(columns=["Outlet", "Variant", "Units Sold", "Actual Revenue (R)"])
+    else:
+        sold_by_variant = (
+            campaign_sales_df
+            .groupby("variant", as_index=False)
+            .agg(
+                {
+                    "units_sold": "sum",
+                    "revenue": "sum",
+                }
+            )
+            .rename(
+                columns={
+                    "variant": "Variant",
+                    "units_sold": "Units Sold",
+                    "revenue": "Actual Revenue (R)",
+                }
+            )
+        )
+
+        sold_by_outlet = (
+            campaign_sales_df
+            .groupby(["outlet", "variant"], as_index=False)
+            .agg(
+                {
+                    "units_sold": "sum",
+                    "revenue": "sum",
+                }
+            )
+            .rename(
+                columns={
+                    "outlet": "Outlet",
+                    "variant": "Variant",
+                    "units_sold": "Units Sold",
+                    "revenue": "Actual Revenue (R)",
+                }
+            )
+        )
+
+    variant_progress_df = available_df.merge(sold_by_variant, on="Variant", how="left")
+    variant_progress_df["Units Sold"] = variant_progress_df["Units Sold"].fillna(0).astype(int)
+    variant_progress_df["Actual Revenue (R)"] = variant_progress_df["Actual Revenue (R)"].fillna(0.0)
+    variant_progress_df["Remaining Units"] = (
+        variant_progress_df["Available Units"] - variant_progress_df["Units Sold"]
+    )
+
+    variant_progress_df["Sell-through %"] = variant_progress_df.apply(
+        lambda row: (
+            row["Units Sold"] / row["Available Units"] * 100
+            if row["Available Units"]
+            else 0
+        ),
+        axis=1,
+    )
+
+    if outlet_detail_df.empty:
+        outlet_progress_df = sold_by_outlet.copy()
+    else:
+        allocated_df = outlet_detail_df[
+            ["Outlet", "Variant", "Units Allocated", "Revenue (R)", "Profit (R)"]
+        ].copy()
+
+        allocated_df = allocated_df.rename(
+            columns={
+                "Revenue (R)": "Projected Revenue (R)",
+                "Profit (R)": "Projected Profit (R)",
+            }
+        )
+
+        outlet_progress_df = allocated_df.merge(
+            sold_by_outlet,
+            on=["Outlet", "Variant"],
+            how="left",
+        )
+
+        outlet_progress_df["Units Sold"] = outlet_progress_df["Units Sold"].fillna(0).astype(int)
+        outlet_progress_df["Actual Revenue (R)"] = outlet_progress_df["Actual Revenue (R)"].fillna(0.0)
+        outlet_progress_df["Remaining Allocated Units"] = (
+            outlet_progress_df["Units Allocated"] - outlet_progress_df["Units Sold"]
+        )
+
+        outlet_progress_df["Outlet Sell-through %"] = outlet_progress_df.apply(
+            lambda row: (
+                row["Units Sold"] / row["Units Allocated"] * 100
+                if row["Units Allocated"]
+                else 0
+            ),
+            axis=1,
+        )
+
+    return variant_progress_df, outlet_progress_df
+
+
+
 saved_session = load_saved_session()
+campaigns = load_campaigns()
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +1092,132 @@ if scol3.button("🧹 Clear"):
 
 
 # ---------------------------------------------------------------------------
+# Sidebar: marketing campaign setup
+# ---------------------------------------------------------------------------
+
+st.sidebar.subheader("Marketing Campaign")
+
+campaign_options = get_campaign_options(campaigns)
+today = date.today()
+
+
+def safe_widget_key(value: str) -> str:
+    """Create a safe Streamlit widget suffix from a campaign name."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip())
+    return cleaned[:80] if cleaned else "new_campaign"
+
+
+if campaign_options:
+    selected_campaign_option = st.sidebar.selectbox(
+        "Load saved campaign",
+        ["➕ Create new campaign"] + campaign_options,
+        key="selected_campaign_to_load",
+        help="Select an existing campaign, or create a new one.",
+    )
+else:
+    selected_campaign_option = "➕ Create new campaign"
+    st.sidebar.caption("No saved campaigns yet.")
+
+
+using_saved_campaign = (
+    selected_campaign_option != "➕ Create new campaign"
+    and selected_campaign_option in campaigns
+)
+
+if using_saved_campaign:
+    campaign_name = selected_campaign_option.strip()
+    selected_campaign_data = campaigns.get(campaign_name, {})
+
+    st.sidebar.text_input(
+        "Campaign name",
+        value=campaign_name,
+        key=f"campaign_name_readonly_{safe_widget_key(campaign_name)}",
+        disabled=True,
+        help="Loaded saved campaign. To create a new campaign, choose Create new campaign above.",
+    )
+
+    default_start = iso_to_date(
+        selected_campaign_data.get("start_date"),
+        today,
+    )
+    default_end = iso_to_date(
+        selected_campaign_data.get("end_date"),
+        today,
+    )
+    date_widget_suffix = safe_widget_key(campaign_name)
+
+else:
+    init_state(
+        "new_campaign_name",
+        "Peony Fresh Launch Campaign",
+        saved_session,
+    )
+
+    campaign_name = st.sidebar.text_input(
+        "Campaign name",
+        key="new_campaign_name",
+        help="Create a campaign name such as Peony Fresh Soweto Launch.",
+    ).strip()
+
+    default_start = today
+    default_end = today
+
+    if campaign_name in campaigns:
+        default_start = iso_to_date(
+            campaigns[campaign_name].get("start_date"),
+            today,
+        )
+        default_end = iso_to_date(
+            campaigns[campaign_name].get("end_date"),
+            today,
+        )
+
+    date_widget_suffix = "new_campaign"
+
+
+campaign_start_date = st.sidebar.date_input(
+    "Campaign start date",
+    value=default_start,
+    key=f"campaign_start_date_{date_widget_suffix}",
+)
+
+campaign_end_date = st.sidebar.date_input(
+    "Campaign end date",
+    value=default_end,
+    key=f"campaign_end_date_{date_widget_suffix}",
+)
+
+campaign_days = max(
+    1,
+    (campaign_end_date - campaign_start_date).days + 1,
+)
+
+st.sidebar.caption(
+    f"Campaign duration: **{campaign_days} day(s)**"
+)
+
+if campaign_end_date < campaign_start_date:
+    st.sidebar.error("Campaign end date cannot be before the start date.")
+
+if st.sidebar.button("💾 Save Campaign"):
+    if not campaign_name:
+        st.sidebar.error("Enter a campaign name first.")
+    elif campaign_end_date < campaign_start_date:
+        st.sidebar.error("Fix the campaign dates first.")
+    else:
+        campaigns = upsert_campaign(
+            campaigns=campaigns,
+            campaign_name=campaign_name,
+            start_date=campaign_start_date,
+            end_date=campaign_end_date,
+        )
+        save_campaigns(campaigns)
+        st.sidebar.success("Campaign saved")
+        st.rerun()
+
+
+
+# ---------------------------------------------------------------------------
 # Sidebar inputs
 # ---------------------------------------------------------------------------
 
@@ -1294,6 +1721,14 @@ competitor_chart_df = build_competitor_chart_df(
     competitor_prices=competitor_prices,
 )
 
+current_campaign = campaigns.get(campaign_name, {})
+campaign_sales_df = build_campaign_sales_df(current_campaign)
+campaign_variant_progress_df, campaign_outlet_progress_df = build_campaign_progress(
+    campaign=current_campaign,
+    order_df=order_df,
+    outlet_detail_df=outlet_detail_df,
+)
+
 eff_cpg = logic.cost_per_gram(
     bag_cost,
     free_stock_pct,
@@ -1322,6 +1757,9 @@ def build_excel() -> bytes:
         outlet_variant_check_df.to_excel(writer, sheet_name="Outlet Variant Check", index=False)
 
         competitor_df.to_excel(writer, sheet_name="Competitor Pricing", index=False)
+        campaign_sales_df.to_excel(writer, sheet_name="Campaign Sales", index=False)
+        campaign_variant_progress_df.to_excel(writer, sheet_name="Campaign Progress", index=False)
+        campaign_outlet_progress_df.to_excel(writer, sheet_name="Campaign Outlet Progress", index=False)
 
         pd.DataFrame(
             [
@@ -1356,7 +1794,7 @@ st.title("💰 Peony Washing Powder Pricing & Margin Model")
 st.caption(
     "Buy 5kg bags • receive promotional free stock • repackage into retail "
     "variants • compare competitor prices • allocate exact stock units to outlets • "
-    "save and reload sessions • track cash turnover and sales plans."
+    "save and reload sessions • track campaigns, sales movement, cash turnover and sales plans."
 )
 
 k1, k2, k3, k4, k5, k6 = st.columns(6)
@@ -1399,7 +1837,7 @@ st.divider()
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
         "📊 Unit Economics",
         "📦 First Order Mix",
@@ -1407,6 +1845,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         "🏪 Outlet Allocation",
         "🏷️ Competitor Pricing",
         "💳 Cash Flow & Terms",
+        "🎯 Campaign Sales",
     ]
 )
 
@@ -2116,13 +2555,364 @@ with tab6:
 
 
 # ---------------------------------------------------------------------------
+# Tab 7: Campaign Sales
+# ---------------------------------------------------------------------------
+
+with tab7:
+    st.subheader("🎯 Marketing Campaign Sales Tracker")
+
+    if not campaign_name:
+        st.warning("Enter and save a campaign name in the sidebar first.")
+    elif campaign_end_date < campaign_start_date:
+        st.error("Campaign end date cannot be before the start date.")
+    elif campaign_name not in campaigns:
+        st.info(
+            "This campaign has not been saved yet. "
+            "Click **Save Campaign** in the sidebar before recording sales."
+        )
+    else:
+        current_campaign = campaigns[campaign_name]
+        campaign_start = iso_to_date(current_campaign.get("start_date"), campaign_start_date)
+        campaign_end = iso_to_date(current_campaign.get("end_date"), campaign_end_date)
+
+        st.caption(
+            f"Campaign period: **{campaign_start.isoformat()}** to "
+            f"**{campaign_end.isoformat()}**"
+        )
+
+        campaign_days = max(1, (campaign_end - campaign_start).days + 1)
+        days_elapsed = min(
+            campaign_days,
+            max(0, (date.today() - campaign_start).days + 1),
+        )
+
+        # Always rebuild from the current campaign so add/delete actions reflect correctly.
+        campaign_sales_df = build_campaign_sales_df(current_campaign)
+        campaign_variant_progress_df, campaign_outlet_progress_df = build_campaign_progress(
+            campaign=current_campaign,
+            order_df=order_df,
+            outlet_detail_df=outlet_detail_df,
+        )
+
+        actual_units_sold = (
+            int(campaign_sales_df["units_sold"].sum())
+            if not campaign_sales_df.empty and "units_sold" in campaign_sales_df.columns
+            else 0
+        )
+
+        actual_revenue = (
+            float(campaign_sales_df["revenue"].sum())
+            if not campaign_sales_df.empty and "revenue" in campaign_sales_df.columns
+            else 0.0
+        )
+
+        projected_campaign_revenue = float(summ["total_revenue"])
+        projected_units = int(total_units)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+
+        c1.metric("Campaign Days", campaign_days)
+        c2.metric("Days Elapsed", days_elapsed)
+        c3.metric("Actual Units Sold", f"{actual_units_sold:,}")
+        c4.metric("Actual Revenue", money(actual_revenue))
+        c5.metric(
+            "Sell-through",
+            f"{(actual_units_sold / projected_units * 100) if projected_units else 0:.1f}%",
+        )
+
+        st.divider()
+        st.subheader("Record a Sale")
+
+        sale_col1, sale_col2, sale_col3, sale_col4 = st.columns(4)
+
+        with sale_col1:
+            sale_date = st.date_input(
+                "Sale date",
+                value=min(max(date.today(), campaign_start), campaign_end),
+                min_value=campaign_start,
+                max_value=campaign_end,
+                key="sale_date",
+            )
+
+        with sale_col2:
+            sale_outlet = st.selectbox(
+                "Outlet / channel",
+                options=outlet_names if outlet_names else ["Direct Sales"],
+                key="sale_outlet",
+            )
+
+        with sale_col3:
+            sale_variant = st.selectbox(
+                "Variant",
+                options=[v.name for v in variants],
+                key="sale_variant",
+            )
+
+        with sale_col4:
+            sale_units = st.number_input(
+                "Units sold",
+                min_value=1,
+                step=1,
+                key="sale_units",
+            )
+
+        selected_variant = next(
+            (v for v in variants if v.name == sale_variant),
+            None,
+        )
+
+        default_sale_price = (
+            float(selected_variant.sell_price)
+            if selected_variant is not None
+            else 0.0
+        )
+
+        sale_price_col, sale_note_col = st.columns([1, 3])
+
+        with sale_price_col:
+            sale_price = st.number_input(
+                "Selling price per unit (R)",
+                min_value=0.0,
+                step=0.5,
+                value=default_sale_price,
+                key="sale_price",
+            )
+
+        with sale_note_col:
+            sale_notes = st.text_input(
+                "Notes",
+                placeholder="Optional: cash sale, promo sale, customer name, etc.",
+                key="sale_notes",
+            )
+
+        if st.button("➕ Add Sale to Campaign"):
+            campaigns = add_campaign_sale(
+                campaigns=campaigns,
+                campaign_name=campaign_name,
+                sale_date=sale_date,
+                outlet=sale_outlet,
+                variant=sale_variant,
+                units_sold=int(sale_units),
+                sell_price=float(sale_price),
+                notes=sale_notes,
+            )
+            save_campaigns(campaigns)
+            st.success("Sale recorded")
+            st.rerun()
+
+        st.divider()
+        st.subheader("Campaign Sales Records")
+
+        if campaign_sales_df.empty:
+            st.warning("No sales recorded for this campaign yet.")
+        else:
+            display_sales_df = campaign_sales_df.copy().reset_index()
+            display_sales_df["index"] = display_sales_df["index"].astype(int)
+            display_sales_df["Record #"] = display_sales_df["index"] + 1
+
+            display_sales_df = display_sales_df.rename(
+                columns={
+                    "sale_date": "Sale Date",
+                    "outlet": "Outlet",
+                    "variant": "Variant",
+                    "units_sold": "Units Sold",
+                    "sell_price": "Sell Price / Unit (R)",
+                    "revenue": "Revenue (R)",
+                    "notes": "Notes",
+                    "recorded_at": "Recorded At",
+                }
+            )
+
+            visible_columns = [
+                "Record #",
+                "Sale Date",
+                "Outlet",
+                "Variant",
+                "Units Sold",
+                "Sell Price / Unit (R)",
+                "Revenue (R)",
+                "Notes",
+                "Recorded At",
+            ]
+
+            visible_columns = [
+                col for col in visible_columns
+                if col in display_sales_df.columns
+            ]
+
+            st.dataframe(
+                display_sales_df[visible_columns].style.format(
+                    {
+                        "Sell Price / Unit (R)": "{:.2f}",
+                        "Revenue (R)": "{:.2f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.divider()
+            st.subheader("Delete Campaign Sales")
+
+            delete_sales_df = campaign_sales_df.copy().reset_index()
+            delete_sales_df["record_index"] = delete_sales_df["index"].astype(int)
+            delete_sales_df["Record #"] = delete_sales_df["record_index"] + 1
+
+            def build_delete_label(row: pd.Series) -> str:
+                sale_date_value = row.get("sale_date", "")
+                outlet_value = row.get("outlet", "")
+                variant_value = row.get("variant", "")
+                units_value = int(row.get("units_sold", 0))
+                revenue_value = float(row.get("revenue", 0.0))
+
+                return (
+                    f"Record {int(row['Record #'])} | "
+                    f"{sale_date_value} | "
+                    f"{outlet_value} | "
+                    f"{variant_value} | "
+                    f"{units_value} units | "
+                    f"{money(revenue_value)}"
+                )
+
+            delete_sales_df["Delete Label"] = delete_sales_df.apply(
+                build_delete_label,
+                axis=1,
+            )
+
+            delete_col1, delete_col2 = st.columns([3, 1])
+
+            with delete_col1:
+                selected_delete_label = st.selectbox(
+                    "Select sale record to delete",
+                    options=delete_sales_df["Delete Label"].tolist(),
+                    key="selected_campaign_sale_to_delete",
+                )
+
+            selected_delete_row = delete_sales_df[
+                delete_sales_df["Delete Label"] == selected_delete_label
+            ].iloc[0]
+
+            selected_delete_index = int(selected_delete_row["record_index"])
+
+            with delete_col2:
+                confirm_delete_sale = st.checkbox(
+                    "Confirm delete",
+                    key="confirm_delete_campaign_sale",
+                )
+
+            delete_button_col1, delete_button_col2 = st.columns(2)
+
+            with delete_button_col1:
+                if st.button("🗑️ Delete Selected Sale"):
+                    if not confirm_delete_sale:
+                        st.error("Tick **Confirm delete** before deleting the sale record.")
+                    else:
+                        campaigns = delete_campaign_sale_at_index(
+                            campaigns=campaigns,
+                            campaign_name=campaign_name,
+                            record_index=selected_delete_index,
+                        )
+                        save_campaigns(campaigns)
+                        st.success("Sale record deleted")
+                        st.rerun()
+
+            with delete_button_col2:
+                confirm_clear_all_sales = st.checkbox(
+                    "Confirm clear all",
+                    key="confirm_clear_all_campaign_sales",
+                )
+
+                if st.button("🧹 Clear All Campaign Sales"):
+                    if not confirm_clear_all_sales:
+                        st.error("Tick **Confirm clear all** before clearing campaign sales.")
+                    else:
+                        campaigns = clear_campaign_sales(
+                            campaigns=campaigns,
+                            campaign_name=campaign_name,
+                        )
+                        save_campaigns(campaigns)
+                        st.success("All sales records cleared for this campaign")
+                        st.rerun()
+
+        st.divider()
+        st.subheader("Campaign Progress by Variant")
+
+        if campaign_variant_progress_df.empty:
+            st.warning("No campaign progress available yet.")
+        else:
+            st.dataframe(
+                campaign_variant_progress_df.style.format(
+                    {
+                        "Actual Revenue (R)": "{:.2f}",
+                        "Sell-through %": "{:.1f}%",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            fig_campaign_variant = px.bar(
+                campaign_variant_progress_df,
+                x="Variant",
+                y=["Units Sold", "Remaining Units"],
+                title="Campaign Units Sold vs Remaining Units",
+                barmode="stack",
+            )
+            st.plotly_chart(fig_campaign_variant, use_container_width=True)
+
+        st.divider()
+        st.subheader("Campaign Progress by Outlet")
+
+        if campaign_outlet_progress_df.empty:
+            st.warning("No outlet campaign progress available yet.")
+        else:
+            st.dataframe(
+                campaign_outlet_progress_df.style.format(
+                    {
+                        "Projected Revenue (R)": "{:.2f}",
+                        "Projected Profit (R)": "{:.2f}",
+                        "Actual Revenue (R)": "{:.2f}",
+                        "Sell-through %": "{:.1f}%",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            fig_campaign_outlet = px.bar(
+                campaign_outlet_progress_df,
+                x="Outlet",
+                y="Actual Revenue (R)",
+                color="Variant",
+                title="Actual Campaign Revenue by Outlet and Variant",
+            )
+            st.plotly_chart(fig_campaign_outlet, use_container_width=True)
+
+        st.divider()
+        st.subheader("Campaign Revenue Target")
+
+        target_progress = (
+            actual_revenue / projected_campaign_revenue * 100
+            if projected_campaign_revenue
+            else 0
+        )
+
+        st.progress(min(target_progress / 100, 1.0))
+
+        st.info(
+            f"Actual revenue: **{money(actual_revenue)}** vs projected campaign revenue: "
+            f"**{money(projected_campaign_revenue)}** | Progress: **{target_progress:.1f}%**"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
 
 st.divider()
 st.subheader("⬇️ Export Calculations")
 
-e1, e2, e3, e4, e5, e6, e7 = st.columns(7)
+e1, e2, e3, e4, e5, e6, e7, e8 = st.columns(8)
 
 e1.download_button(
     "📗 Excel all sheets",
@@ -2170,6 +2960,13 @@ e7.download_button(
     "🏷️ Competitor Pricing CSV",
     competitor_df.to_csv(index=False),
     "competitor_pricing.csv",
+    "text/csv",
+)
+
+e8.download_button(
+    "🎯 Campaign Sales CSV",
+    campaign_sales_df.to_csv(index=False),
+    "campaign_sales.csv",
     "text/csv",
 )
 

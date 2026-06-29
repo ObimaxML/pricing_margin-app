@@ -21,3 +21,6 @@ Thumbs.db
 
 # VSCode
 .vscode/
+
+peony_pricing_session.json
+peony_marketing_campaigns.json
