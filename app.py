@@ -34,6 +34,28 @@ FIVE_KG_GRAMS = 5000
 SESSION_FILE = Path(__file__).with_name("peony_pricing_session.json")
 CAMPAIGN_FILE = Path(__file__).with_name("peony_marketing_campaigns.json")
 
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "assets"
+PEONY_LOGO = ASSETS_DIR / "peony_logo.png"
+
+# If peony_logo.png is not found, automatically use the first image in /assets.
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def get_logo_path() -> Path | None:
+    if PEONY_LOGO.exists():
+        return PEONY_LOGO
+
+    if not ASSETS_DIR.exists():
+        return None
+
+    image_files = sorted(
+        p for p in ASSETS_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    )
+
+    return image_files[0] if image_files else None
+
 
 # ---------------------------------------------------------------------------
 # Page config & styling
@@ -1063,6 +1085,13 @@ def build_outlet_variant_allocation(
 # Sidebar: session controls
 # ---------------------------------------------------------------------------
 
+sidebar_logo_path = get_logo_path()
+
+if sidebar_logo_path is not None:
+    st.sidebar.image(str(sidebar_logo_path), width=160)
+else:
+    st.sidebar.warning(f"Logo not found. Add an image to: {ASSETS_DIR}")
+
 st.sidebar.title("⚙️ Model Inputs")
 
 st.sidebar.subheader("Session")
@@ -1788,6 +1817,13 @@ def build_excel() -> bytes:
 # ---------------------------------------------------------------------------
 # Header & KPIs
 # ---------------------------------------------------------------------------
+
+main_logo_path = get_logo_path()
+
+if main_logo_path is not None:
+    st.image(str(main_logo_path), width=220)
+else:
+    st.warning(f"Logo not found. Add an image to: {ASSETS_DIR}")
 
 st.title("💰 Peony Washing Powder Pricing & Margin Model")
 
